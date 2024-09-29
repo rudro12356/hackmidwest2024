@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import base64
 from flask import Flask, request, jsonify
@@ -11,7 +12,7 @@ load_dotenv()
 # Initialize the Claude model through AWS Bedrock
 bedrock_runtime = boto3.client(
     service_name="bedrock-runtime",
-    region_name="us-west-2"  # Choose the region where your Bedrock model is deployed
+    region_name="us-west-2"
 )
 
 # Flask app setup
@@ -38,16 +39,10 @@ def get_weather_data(location):
         }
     else:
         return None
-    
-def pil_to_base64(image_data):
-    """
-    Converts an uploaded image to a base64 string.
-    """
-    return base64.b64encode(image_data).decode("utf-8")
 
-def generate_conversation(system_prompts, messages):
+def generate_conversation_text(system_prompts, messages):
     """
-    Sends messages to the Claude model on AWS Bedrock and returns the response.
+    Sends text-only messages to the Claude model on AWS Bedrock and returns the response.
     """
     model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"
     temperature = 0.3
@@ -66,11 +61,51 @@ def generate_conversation(system_prompts, messages):
     text_response = response["output"]["message"]["content"][0]["text"]
     return text_response
 
+def generate_conversation_with_image(system_prompt, message, image_data):
+    """
+    Sends messages with image to the Claude model on AWS Bedrock and returns the response.
+    """
+    model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    
+    prompt_config = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image_data["source"]["media_type"],
+                            "data": image_data["source"]["data"],
+                        },
+                    },
+                    {"type": "text", "text": message},
+                ],
+            }
+        ],
+        "system": system_prompt
+    }
+
+    body = json.dumps(prompt_config)
+    accept = "application/json"
+    content_type = "application/json"
+
+    response = bedrock_runtime.invoke_model(
+        body=body, modelId=model_id, accept=accept, contentType=content_type
+    )
+    response_body = json.loads(response.get("body").read())
+
+    results = response_body.get("content")[0].get("text")
+    return results
+
 @app.route('/chat', methods=['POST'])
 def chat():
     """
     API endpoint for handling chat requests. 
-    Receives user message and location, incorporates weather data, and returns model response.
+    Receives user message, location, and optional image, incorporates weather data, and returns model response.
     """
     data = request.get_json()
 
@@ -79,64 +114,42 @@ def chat():
 
     user_message = data['message']
     location = data['location']
+    image_data = data.get('image')
 
     # Fetch weather data based on the user's location
     weather_data = get_weather_data(location)
 
     if weather_data:
-        # Incorporate the weather data into the system prompt
         weather_info = f"The current weather in {location} is {weather_data['weather_description']}, " \
                        f"with a temperature of {weather_data['temperature']}°C and humidity of {weather_data['humidity']}%."
     else:
         weather_info = "Weather data is unavailable for the given location."
 
     # System prompt that includes weather data
-    system_prompt = [{
-        "text": f"""
-        The farmer is located in {location}. {weather_info} Use this weather data to provide contextually relevant advice.
-        You are an expert agricultural advisor for the farmer who is specializing in crop management, soil health, and disease prevention. Provide clear, step-by-step advice to farmers, using logical reasoning and simple explanations. 
-        Incorporate weather and soil data when available to make your recommendations actionable and context-specific.
+    system_prompt = f"""
+    The farmer is located in {location}. {weather_info} Use this weather data to provide contextually relevant advice.
+    You are an expert agricultural advisor for the farmer who is specializing in crop management, soil health, and disease prevention. Provide clear, step-by-step advice to farmers, using logical reasoning and simple explanations. 
+    Incorporate weather and soil data when available to make your recommendations actionable and context-specific.
 
-            For each query:
-            1. Break down the reasoning behind your recommendation in a step-by-step manner.
-            2. Use simple language to ensure the farmer understands your reasoning.
-            3. Provide examples where relevant to clarify your suggestions.
+    If an image is provided, analyze it for any visible plant diseases or issues, and incorporate your findings into your response.
 
-            **Example 1**:
-            Query: "What crops should I grow in sandy soil?"
-            Response:
-            1. Sandy soil drains quickly, which makes it ideal for crops that prefer well-drained soil.
-            2. Crops like carrots, peanuts, and potatoes are well-suited to sandy soil because they thrive in low-moisture environments.
-            Recommendation: I suggest growing carrots, peanuts, or potatoes, but ensure regular fertilization to improve soil nutrients.
+    For each query:
+    1. Break down the reasoning behind your recommendation in a step-by-step manner.
+    2. Use simple language to ensure the farmer understands your reasoning.
+    3. Provide examples where relevant to clarify your suggestions.
 
-            **Example 2**:
-            Query: "How should I treat yellow spots on tomato leaves?"
-            Response:
-            1. Yellow spots can indicate a fungal disease like early blight or septoria leaf spot.
-            2. Inspect the leaves for a yellow halo or browning in the center to confirm.
-            3. Treat by removing affected leaves and applying a copper-based fungicide.
-            Recommendation: Apply copper-based fungicide and ensure good airflow to reduce disease spread.
+    You will strictly only provide advice on crop management, soil health, and disease prevention. Avoid discussing other topics.
+    """
 
-            **Example 3**:
-            Query: "Should I water my crops today if it's going to rain tomorrow?"
-            Response:
-            1. Consider the current soil moisture and weather forecast.
-            2. If the soil is still moist and rain is expected, it's better to wait to avoid overwatering.
-            Recommendation: Check soil moisture levels. If moist, wait for the rain; if dry, water lightly.
+    if image_data:
+        # Use invoke_model for queries with images
+        response = generate_conversation_with_image(system_prompt, user_message, image_data)
+    else:
+        # Use converse for text-only queries
+        messages = [{"role": "user", "content": [{"text": user_message}]}]
+        response = generate_conversation_text([{"text": system_prompt}], messages)
 
-        You will strictly only provide advice on crop management, soil health, and disease prevention. Avoid discussing other topics.
-        """
-    }]
-
-    message = {
-        "role": "user",
-        "content": [{"text": user_message}]
-    }
-
-    # Get the response from Claude
-    response = generate_conversation(system_prompt, [message])
     return jsonify({"response": response})
-
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=3000)
