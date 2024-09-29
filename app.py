@@ -1,22 +1,56 @@
-import time
-import boto3
+import os
+import requests
+import base64
 from flask import Flask, request, jsonify
+import boto3
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Initialize the Claude model through AWS Bedrock
 bedrock_runtime = boto3.client(
     service_name="bedrock-runtime",
-    region_name="us-west-2",  # Choose the region where your Bedrock model is deployed
+    region_name="us-west-2"  # Choose the region where your Bedrock model is deployed
 )
 
 # Flask app setup
 app = Flask(__name__)
+
+# Weatherstack API key from .env
+WEATHERSTACK_API_KEY = os.getenv('WEATHER_API_KEY')
+
+def get_weather_data(location):
+    """
+    Fetch weather data from Weatherstack API.
+    """
+    url = f"http://api.weatherstack.com/current?access_key={WEATHERSTACK_API_KEY}&query={location}"
+    
+    response = requests.get(url)
+    data = response.json()
+    
+    if response.status_code == 200 and 'current' in data:
+        weather_info = data['current']
+        return {
+            'temperature': weather_info['temperature'],
+            'humidity': weather_info['humidity'],
+            'weather_description': weather_info['weather_descriptions'][0]
+        }
+    else:
+        return None
+    
+def pil_to_base64(image_data):
+    """
+    Converts an uploaded image to a base64 string.
+    """
+    return base64.b64encode(image_data).decode("utf-8")
 
 def generate_conversation(system_prompts, messages):
     """
     Sends messages to the Claude model on AWS Bedrock and returns the response.
     """
     model_id = "anthropic.claude-3-5-sonnet-20240620-v1:0"
-    temperature = 0.5
+    temperature = 0.3
 
     inference_config = {"temperature": temperature}
 
@@ -36,55 +70,73 @@ def generate_conversation(system_prompts, messages):
 def chat():
     """
     API endpoint for handling chat requests. 
-    Receives a system prompt and user message, returns model response.
+    Receives user message and location, incorporates weather data, and returns model response.
     """
     data = request.get_json()
-    system_prompt = [{"text": data.get("system_prompt", """You are an expert agricultural advisor with deep knowledge in crop management, disease diagnosis, and soil health. You will assist farmers by providing detailed, step-by-step guidance using Chain of Thought reasoning. You will also apply few-shot learning by learning from a few provided examples to give accurate and actionable advice. Your goal is to ensure that farmers understand the reasoning behind each recommendation and provide them with clear, actionable steps for improving their crops' health and yield.
 
-    Instructions:
-    - For every query, break down your reasoning process step-by-step.
-    - Always explain the logic behind your recommendations in simple terms.
-    - Use examples where necessary to enhance understanding.
-    - Provide holistic advice, considering factors like soil type, weather conditions, and common crop diseases.
+    if not data or 'message' not in data or 'location' not in data:
+        return jsonify({"error": "Message and location required"}), 400
 
-    Example 1:
-    Farmer's Query: "What crops can I grow in sandy soil?"
-    Claude's Response:
-    1. Sandy soil drains water quickly and tends to dry out faster than other types of soil. This means crops that thrive in well-drained soil are ideal.
-    2. Crops like carrots, potatoes, and peanuts have roots that can handle the faster water drainage and nutrient leaching that occurs in sandy soil.
-    3. It’s important to note that sandy soil often lacks nutrients, so regular fertilization will be necessary to maintain healthy crops.
-    Recommendation: I suggest growing carrots, potatoes, or peanuts, but remember to supplement the soil with organic matter and fertilizers to enhance its nutrient content.
+    user_message = data['message']
+    location = data['location']
 
-    Example 2:
-    Farmer's Query: "How should I treat yellow spots on my tomato plants?"
-    Claude's Response:
-    1. Yellow spots on tomato leaves are often a sign of fungal diseases, such as early blight or septoria leaf spot.
-    2. To confirm, check if the spots have a yellow halo or if they are starting to brown in the center. If yes, it is likely early blight.
-    3. Treatment involves removing the affected leaves and applying a copper-based fungicide. Improving airflow around the plants and avoiding overhead watering can also prevent the spread.
-    Recommendation: Based on your description, I would recommend using a copper-based fungicide and ensuring your tomato plants are pruned for better airflow. Also, avoid getting the leaves wet when watering to reduce further spread of the disease.
+    # Fetch weather data based on the user's location
+    weather_data = get_weather_data(location)
 
-    Example 3:
-    Farmer's Query: "Should I water my crops today if it's going to rain tomorrow?"
-    Claude's Response:
-    1. It’s important to consider both the current soil moisture and the upcoming weather forecast.
-    2. If the soil is still moist from previous irrigation, and rain is expected tomorrow, it may be better to hold off on watering to avoid over-saturating the soil, which could lead to root rot.
-    3. However, if the soil is dry and the rain forecast is uncertain, providing a light watering could be beneficial to prevent plant stress.
-    Recommendation: I suggest checking the soil moisture. If it's still moist, wait until after the rain. If it's dry and you're unsure about the rain, give the plants a light watering.
+    if weather_data:
+        # Incorporate the weather data into the system prompt
+        weather_info = f"The current weather in {location} is {weather_data['weather_description']}, " \
+                       f"with a temperature of {weather_data['temperature']}°C and humidity of {weather_data['humidity']}%."
+    else:
+        weather_info = "Weather data is unavailable for the given location."
 
-    """
-    )}]
-    user_message = data.get("message", "")
+    # System prompt that includes weather data
+    system_prompt = [{
+        "text": f"""
+        The farmer is located in {location}. {weather_info} Use this weather data to provide contextually relevant advice.
+        You are an expert agricultural advisor for the farmer who is specializing in crop management, soil health, and disease prevention. Provide clear, step-by-step advice to farmers, using logical reasoning and simple explanations. 
+        Incorporate weather and soil data when available to make your recommendations actionable and context-specific.
 
-    if not user_message:
-        return jsonify({"error": "No message provided."}), 400
+            For each query:
+            1. Break down the reasoning behind your recommendation in a step-by-step manner.
+            2. Use simple language to ensure the farmer understands your reasoning.
+            3. Provide examples where relevant to clarify your suggestions.
+
+            **Example 1**:
+            Query: "What crops should I grow in sandy soil?"
+            Response:
+            1. Sandy soil drains quickly, which makes it ideal for crops that prefer well-drained soil.
+            2. Crops like carrots, peanuts, and potatoes are well-suited to sandy soil because they thrive in low-moisture environments.
+            Recommendation: I suggest growing carrots, peanuts, or potatoes, but ensure regular fertilization to improve soil nutrients.
+
+            **Example 2**:
+            Query: "How should I treat yellow spots on tomato leaves?"
+            Response:
+            1. Yellow spots can indicate a fungal disease like early blight or septoria leaf spot.
+            2. Inspect the leaves for a yellow halo or browning in the center to confirm.
+            3. Treat by removing affected leaves and applying a copper-based fungicide.
+            Recommendation: Apply copper-based fungicide and ensure good airflow to reduce disease spread.
+
+            **Example 3**:
+            Query: "Should I water my crops today if it's going to rain tomorrow?"
+            Response:
+            1. Consider the current soil moisture and weather forecast.
+            2. If the soil is still moist and rain is expected, it's better to wait to avoid overwatering.
+            Recommendation: Check soil moisture levels. If moist, wait for the rain; if dry, water lightly.
+
+        You will strictly only provide advice on crop management, soil health, and disease prevention. Avoid discussing other topics.
+        """
+    }]
 
     message = {
         "role": "user",
         "content": [{"text": user_message}]
     }
 
+    # Get the response from Claude
     response = generate_conversation(system_prompt, [message])
     return jsonify({"response": response})
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=3000)
